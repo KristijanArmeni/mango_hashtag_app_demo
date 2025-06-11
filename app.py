@@ -1,9 +1,9 @@
-from plots import plot_gini_plotly, plot_bar_plotly, plot_users_plotly, FS
+from plots import plot_gini_plotly, plot_bar_plotly, plot_users_plotly
 from hashtags import secondary_analyzer, COL_AUTHOR_ID, COL_TIME, COL_POST
-from matplotlib import pyplot as plt
 import polars as pl
 import numpy as np
 from pathlib import Path
+from functools import lru_cache
 
 from shiny import App, ui, render, reactive
 from shinywidgets import render_widget, output_widget
@@ -22,7 +22,12 @@ question_circle_fill = ui.HTML(
 )
 
 
+@lru_cache(maxsize=32)
 def load_raw_data_subset(time_start, time_end, user_id, hashtag):
+    # Convert datetime objects to strings for caching
+    time_start_str = time_start.isoformat() if hasattr(time_start, 'isoformat') else str(time_start)
+    time_end_str = time_end.isoformat() if hasattr(time_end, 'isoformat') else str(time_end)
+    
     lf = pl.scan_parquet(source=DATA_RAW)
 
     df_ = (
@@ -47,18 +52,26 @@ def load_raw_data_subset(time_start, time_end, user_id, hashtag):
     return df_
 
 
+@lru_cache(maxsize=1)
 def load_primary_output():
     df = pl.read_parquet(DATA)
-
     df = df.with_columns(pl.col("timewindow_start").dt.replace_time_zone("UTC"))
-
     return df
 
 
-df = load_primary_output()
+# Lazy load primary data
+df = None
 
-# Calculate step size from the data
-time_step = df["timewindow_start"][1] - df["timewindow_start"][0]
+# Time step will be calculated when data is loaded
+time_step = None
+
+def get_time_step():
+    """Calculate time step from data when needed"""
+    global time_step
+    if time_step is None:
+        data = load_primary_output()
+        time_step = data["timewindow_start"][1] - data["timewindow_start"][0]
+    return time_step
 
 
 def select_users(secondary_output, selected_hashtag):
@@ -71,53 +84,6 @@ def select_users(secondary_output, selected_hashtag):
     return users_df
 
 
-def plot_bar(data_frame):
-    fig3, ax3 = plt.subplots(figsize=(8, 6), layout="constrained")
-
-    if len(data_frame) == 0:
-        ax3.text(
-            0.5,
-            0.5,
-            "No data for selected date",
-            ha="center",
-            va="center",
-            transform=ax3.transAxes,
-            fontsize=14,
-        )
-        ax3.set_xlim(0, 1)
-        ax3.set_ylim(0, 1)
-    else:
-        FREQ_THRESHOLD = 0.5
-        df_out3 = data_frame.filter(pl.col("hashtag_perc") > FREQ_THRESHOLD)
-
-        if len(df_out3) == 0:
-            ax3.text(
-                0.5,
-                0.5,
-                "No hashtags above threshold",
-                ha="center",
-                va="center",
-                transform=ax3.transAxes,
-                fontsize=14,
-            )
-            ax3.set_xlim(0, 1)
-            ax3.set_ylim(0, 1)
-        else:
-            x3 = np.arange(len(df_out3["hashtags"].to_numpy()))
-            y3 = df_out3["hashtag_perc"].to_numpy()[::-1]
-
-            ax3.barh(x3, y3, color="tab:blue")
-
-            for i, el in enumerate(df_out3["hashtags"][::-1]):
-                ax3.text(x=y3[i], y=i - 0.15, s=el, color="tab:gray", fontsize=12)
-
-    ax3.tick_params(labelsize=FS)
-    ax3.set_xlabel("% all hashtags", fontsize=FS)
-    ax3.spines["top"].set_visible(False)
-    ax3.spines["right"].set_visible(False)
-    ax3.get_yaxis().set_visible(False)
-
-    return fig3
 
 
 page_dependencies = ui.tags.head(
@@ -168,8 +134,8 @@ hashtag_plot_panel = ui.card(
     ui.input_selectize(
         id="date_picker",
         label="Show hashtags for time period starting on:",
-        choices=[dt.strftime("%B %d, %Y") for dt in df["timewindow_start"].to_list()],
-        selected=df["timewindow_start"].first().strftime("%B %d, %Y"),
+        choices=[],  # Will be populated by reactive effect
+        selected=None,
         width="100%",
     ),
     output_widget("bar_plot", height="1500px"),
@@ -263,18 +229,43 @@ app_ui = ui.page_navbar(
 
 
 def server(input, output, session):
-    def get_selected_datetime():
-        """Convert selected formatted date back to datetime"""
-        selected_formatted = input.date_picker()
+    @reactive.calc
+    def get_df():
+        """Lazy load primary data"""
+        global df
+        if df is None:
+            df = load_primary_output()
+        return df
+    
+    @reactive.effect
+    def populate_date_choices():
+        """Populate date picker choices when data is loaded"""
+        current_df = get_df()
+        choices = [dt.strftime("%B %d, %Y") for dt in current_df["timewindow_start"].to_list()]
+        ui.update_selectize(
+            "date_picker",
+            choices=choices,
+            selected=current_df["timewindow_start"].first().strftime("%B %d, %Y"),
+            session=session,
+        )
+    
+    @lru_cache(maxsize=100)
+    def get_selected_datetime_cached(selected_formatted):
+        """Convert selected formatted date back to datetime with caching"""
+        current_df = get_df()
         # Find the datetime that matches the formatted string
-        for dt in df["timewindow_start"].to_list():
+        for dt in current_df["timewindow_start"].to_list():
             if dt.strftime("%B %d, %Y") == selected_formatted:
                 return dt
-        return df["timewindow_start"].first()  # fallback
+        return current_df["timewindow_start"].first()  # fallback
+    
+    def get_selected_datetime():
+        return get_selected_datetime_cached(input.date_picker())
 
     @reactive.calc
     def selected_date():
-        x_selected = df.with_columns(
+        current_df = get_df()
+        x_selected = current_df.with_columns(
             sel=pl.col("timewindow_start") == input.date_picker()
         ).select(pl.col("sel"))
 
@@ -283,7 +274,8 @@ def server(input, output, session):
     @reactive.calc
     def secondary_analysis():
         timewindow = get_selected_datetime()
-        df_out2 = secondary_analyzer(df, timewindow)
+        current_df = get_df()
+        df_out2 = secondary_analyzer(current_df, timewindow)
         return df_out2
 
     @reactive.effect
@@ -315,7 +307,8 @@ def server(input, output, session):
     def line_plot():
         selected_date = get_selected_datetime()
         smooth_enabled = input.smooth_checkbox()
-        return plot_gini_plotly(df=df, x_selected=selected_date, smooth=smooth_enabled)
+        current_df = get_df()
+        return plot_gini_plotly(df=current_df, x_selected=selected_date, smooth=smooth_enabled)
 
     @render_widget
     def bar_plot():
@@ -357,7 +350,7 @@ def server(input, output, session):
     @render.text
     def tweets_title():
         timewindow = get_selected_datetime()
-        timewindow_end = timewindow + time_step
+        timewindow_end = timewindow + get_time_step()
         format_code = "%B %d, %Y"
         dates_formatted = f"{timewindow.strftime(format_code)} - {timewindow_end.strftime(format_code)}"
 
@@ -369,7 +362,7 @@ def server(input, output, session):
 
         df_posts = load_raw_data_subset(
             time_start=timewindow,
-            time_end=timewindow + time_step,
+            time_end=timewindow + get_time_step(),
             user_id=input.user_picker(),
             hashtag=input.hashtag_picker(),
         )
