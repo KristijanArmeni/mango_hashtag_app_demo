@@ -272,7 +272,7 @@ def plot_bar_plotly(data_frame, selected_date=None, show_title=True):
     return fig
 
 
-def plot_users_plotly(users_data, selected_hashtag=None):
+def plot_users_plotly(users_data):
     """Create an interactive plotly bar plot for user distribution"""
 
     if len(users_data) == 0:
