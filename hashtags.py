@@ -113,9 +113,6 @@ def secondary_analyzer(primary_output, timewindow):
                 pl.col(OUTPUT_COL_HASHTAGS).count() / pl.col("n_hashtags").first()
             )
             * 100,
-            user_ratio=pl.col(OUTPUT_COL_USERS).unique().len()
-            / pl.col(OUTPUT_COL_USERS).len(),
-            common_user=pl.col(OUTPUT_COL_USERS).value_counts(sort=True),
         )
         .sort(by="hashtag_perc", descending=True)
         .with_columns(
